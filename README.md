@@ -34,6 +34,9 @@ The processed data will be organized in ./data/ as following structure:
 
     bash run_scripts/train_clean_voxel.sh demo_airplane
 
+### 2. Train a robust texture
+In Progress...
+
 ## Citation
 ```
 @inproceedings{ranyou,
