@@ -30,7 +30,9 @@ The processed data will be organized in ./data/ as following structure:
     pip install -r requirements.txt
 
 ## Demo
-In progress...
+### 1. Train a voxel representation
+
+    bash run_scripts/train_clean_voxel.sh demo_airplane
 
 ## Citation
 ```
