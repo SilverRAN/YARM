@@ -4,10 +4,7 @@ import imageio
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from thre3d_atom.thre3d_reprs.sd import StableDiffusion
 from matplotlib import colors, cm
-from thre3d_atom.thre3d_reprs.cross_attn import text_under_image
-from thre3d_atom.modules.sds_trainer import _get_dir_batch_from_poses
 from thre3d_atom.modules.volumetric_model import VolumetricModel
 from thre3d_atom.utils.constants import EXTRA_ACCUMULATED_WEIGHTS, NUM_COLOUR_CHANNELS
 from thre3d_atom.utils.imaging_utils import (
@@ -47,12 +44,12 @@ def render_camera_path_for_volumetric_model(
     total_frames = len(camera_path) + 1
     for frame_num, render_pose in enumerate(camera_path):
         log.info(f"rendering frame number: ({frame_num + 1}/{total_frames})")
-        rendered_output = vol_mod.render_with_delta(
+        rendered_output = vol_mod.render(
             render_pose,
-            delta,
             camera_intrinsics,
             gpu_render=False,
             verbose=True,
+            delta=delta,
             **overridden_config_dict,
         )
         colour_frame = rendered_output.colour.numpy()
