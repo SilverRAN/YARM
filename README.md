@@ -40,18 +40,30 @@ The processed data will be organized in ./data/ as following structure:
     conda activate yarm
     pip install -r requirements.txt
 
-## Demo
+## Demo (Train robust texture for a single object)
 ### 1. Train a voxel representation
 
     bash run_scripts/train_clean_voxel.sh demo_airplane
 
-### 2. Train a robust texture
+### 2. Train robust texture
 
     bash run_scripts/synthesize_robust_texture.sh demo_airplane resnet18 404
 
 Classifier can be chosen from ["renset18", "vgg16"]. For the corresponding groundtruth index, please look into [This file](object_label.json)
-### 3. Train universal texture
-In Progress...
+
+## Train universal texture for multiple objects under a same category
+To do this, you need to prepare and preprocess IM3D dataset. Here we take "airliner" objects in IM3D as an example.
+### 1. Train voxel representation for each object
+
+    bash run_scripts/train_clean_voxel.sh airliner_01
+
+Replace "airliner_01" to ["airliner_02", "airliner_03", ..., "airliner_10"] to learn for each object.
+
+### 2. Train universal robust
+
+    bash run_scripts/synthesize_universal_tex.sh airliner resnet18 404
+
+The universal texture will be trained on airliner_01 to airliner_09 and tested on airliner_10.
 
 ## Citation
 ```
