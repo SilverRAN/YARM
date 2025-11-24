@@ -4,7 +4,8 @@ Modified from sds_trainer
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
+import random
 
 import torch
 import numpy as np
@@ -468,6 +469,428 @@ def train_sh_vox_grid_vol_mod_with_posed_images_and_corruption(
     )
     return sds_vol_mod
 
+def train_multi_sh_vox_grid_vol_mod_with_posed_images_and_corruption(
+    sds_vol_mod_list: List[VolumetricModel],
+    pretrained_vol_mod: VolumetricModel,
+    train_dataset: PosedImagesDataset,
+    image_dims: tuple,
+    # required arguments:
+    output_dir: Path,
+    # optional arguments:)
+    image_batch_cache_size: int = 8,
+    ray_batch_size: int = 32768,
+    num_iterations: int = 2000,
+    scale_factor: float = 2.0,
+    # learning_rate and related arguments
+    learning_rate: float = 0.03,
+    lr_decay_start: int = 5000,
+    lr_freq: int = 400,
+    lr_gamma: float = 0.8,
+    # option to have a specific feedback_pose_for_visual feedback rendering
+    render_feedback_pose: Optional[CameraPose] = None,
+    # various training-loop frequencies
+    save_freq: int = 1000,
+    feedback_freq: int = 100,
+    summary_freq: int = 10,
+    # regularization option:
+    apply_diffuse_render_regularization: bool = True,
+    # miscellaneous options can be left untouched
+    num_workers: int = 4,
+    verbose_rendering: bool = True,
+    sds_prompt: str = "none",
+    new_frame_frequency: int = 1,
+    density_correlation_weight: float = 0.0,
+    feature_correlation_weight: float = 0.0,
+    tv_density_weight: float = 0.0,
+    tv_features_weight: float = 0.0,
+    do_sds: bool = True,
+    sds_t_freq: int = 200,
+    sds_t_start: int = 1500,
+    sds_t_gamma: float = 1.0,
+    uncoupled_mode: bool = False,
+    data_pose_mode: bool = False,
+    uncoupled_l2_mode: bool = False,
+    log_wandb: bool = False,
+    l2_mode: bool = False,
+    l1_mode: bool = False,
+    proxy_model: Optional[str] = 'resnet18',
+    label: Optional[int] = 559,
+    delta_bound: Optional[float] = 5.0
+) -> VolumetricModel:
+    """
+    ------------------------------------------------------------------------------------------------------
+    |                               !!! :D LONG FUNCTION ALERT :D !!!                                    |
+    ------------------------------------------------------------------------------------------------------
+    trains a volumetric model given a dataset of images and corresponding poses
+    Args:
+        vol_mod: the volumetricModel to be trained with this procedure. Please note that it should have
+                 an sh-based VoxelGrid as its underlying thre3d_repr.
+        train_dataset: PosedImagesDataset used for training
+        output_dir: path to the output directory where the assets of the training are to be written
+        random_initializer: the pytorch initialization routine used for features of voxel_grid
+        test_dataset: optional dataset of test images and poses :)
+        image_batch_cache_size: batch of images from which rays are sampled per training iteration
+        ray_batch_size: number of randomly sampled rays used per training iteration
+        num_iterations_per_stage: iterations performed per stage
+        scale_factor: factor by which the grid is up-scaled after each stage
+        learning_rate: learning rate used for differential optimization
+        lr_decay_gamma_per_stage: value of gamma for learning rate-decay in a single stage
+        lr_decay_steps_per_stage: steps after which exponential learning rate decay is kicked in
+        stagewise_lr_decay_gamma: gamma reduction of learning rate after each stage
+        render_feedback_pose: optional feedback pose used for generating the rendered feedback
+        save_freq: number of iterations after which checkpoints are saved
+        test_freq: number of iterations after which testing scores are computed
+        feedback_freq: number of iterations after which feedback is generated
+        summary_freq: number of iterations after which current loss is logged to console
+        apply_diffuse_render_regularization: whether to apply the diffuse render regularization
+        num_workers: num_workers used by pytorch dataloader
+        verbose_rendering: bool to control whether to show verbose details while generating rendered feedback
+        fast_debug_mode: bool to control fast_debug_mode, skips testing and some other things
+        diffuse_weight: weight for diffuse loss - used for regularization
+        spcular_weight: weight for specular loss - used for regularization
+
+    Returns: the trained version of the VolumetricModel. Also writes multiple assets to disk
+    """
+
+    # assertions about the VolumetricModel being used with this TrainProcedure :)
+    assert (
+        sds_vol_mod_list[0].render_procedure == render_sh_voxel_grid
+    ), f"sorry, non SH-based VoxelGrids cannot be used with this TrainProcedure"
+
+    assert (
+        sds_prompt != "none"
+    ), f"sorry, you have to supply a text prompt to use SDS"
+
+    im_h, im_w = image_dims
+
+    # get regular density for dcl
+    regular_density = pretrained_vol_mod.thre3d_repr._densities.detach()
+    regular_features = pretrained_vol_mod.thre3d_repr._features.detach()
+
+    # init sds loss class
+    class_loss = ClassificationLoss(sds_vol_mod_list[0].device, 
+                                     proxy_model=proxy_model)
+    direction_batch = None
+    selected_idx_in_batch = [0]
+
+    # set up training dataset for uncoupled mode:
+    # extract the camera_bounds and camera_intrinsics for rest of the procedure
+    camera_bounds, camera_intrinsics = (
+        train_dataset.camera_bounds,
+        train_dataset.camera_intrinsics,
+    )
+    
+    if uncoupled_mode or data_pose_mode:
+        stagewise_train_datasets = [train_dataset]
+        dataset_config_dict = train_dataset.get_config_dict()
+        data_downsample_factor = dataset_config_dict["downsample_factor"]
+        dataset_config_dict.update(
+            {"downsample_factor": data_downsample_factor * scale_factor}
+        )
+        stagewise_train_datasets.insert(0, PosedImagesDataset(**dataset_config_dict))
+
+        train_dl = _make_dataloader_from_dataset(
+            train_dataset, image_batch_cache_size, num_workers
+        )
+
+        infinite_train_dl = iter(infinite_dataloader(train_dl))
+
+    # setup output directories
+    # fmt: off
+    model_dir = output_dir / "saved_models"
+    logs_dir = output_dir / "training_logs"
+    tensorboard_dir = logs_dir / "tensorboard"
+    render_dir = logs_dir / "rendered_output"
+    for directory in (model_dir, logs_dir, tensorboard_dir,
+                      render_dir):
+        directory.mkdir(exist_ok=True, parents=True)
+    # fmt: on
+
+    # save the real_feedback_test_image if it exists:
+    feedback_pose_given = False
+    if render_feedback_pose is not None:
+        feedback_pose_given = True
+    
+    # start actual training
+    log.info("beginning training")
+    time_spent_actually_training = 0
+
+    # -----------------------------------------------------------------------------------------
+    #  Main Training Loop                                                                     |
+    # -----------------------------------------------------------------------------------------
+
+    # setup volumetric_model's optimizer
+    delta = torch.randn_like(sds_vol_mod_list[0].thre3d_repr._features, device=sds_vol_mod_list[0].device, requires_grad=True)
+    params=[{"params": delta, "lr": learning_rate}]
+                
+    optimizer = torch.optim.Adam(
+        params=params,
+        betas=(0.9, 0.999),
+    )
+    # setup learning rate schedulers for the optimizer
+    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer, gamma=lr_gamma
+    )
+
+    log.info(
+        f"voxel grid resolution: {sds_vol_mod_list[0].thre3d_repr.grid_dims} "
+        f"training images resolution: [{im_h} x {im_w}]"
+    )
+    current_lrs = [
+        param_group["lr"] for param_group in optimizer.param_groups
+    ]
+    log_string = f"current stage learning rates: {current_lrs} "
+    log.info(log_string)
+    last_time = time.perf_counter()
+    
+    # -------------------------------------------------------------------------------------
+    #  Single Stage Training Loop                                                         |
+    # -------------------------------------------------------------------------------------
+
+    for global_step in range(1, num_iterations + 1):
+        with torch.no_grad():
+            delta.data.clamp_(-delta_bound, delta_bound)
+        idx = int(random.random() * len(sds_vol_mod_list))
+        sds_vol_mod = sds_vol_mod_list[idx]
+        # ---------------------------------------------------------------------------------
+        #  Main Operations Performed Per Iteration                                        |
+        # ---------------------------------------------------------------------------------
+        # sample a batch rays and pixels for a single iteration
+        # load a batch of images and poses (These could already be cached on GPU)
+        # please check the `data.datasets` module
+        total_loss = 0
+        # sample a subset of rays and pixels synchronously
+
+        sds_density = sds_vol_mod.thre3d_repr._densities
+        sds_features = sds_vol_mod.thre3d_repr._features
+
+        # -------------------
+        #  Get Input Pose:  |
+        # -------------------
+
+        if global_step % new_frame_frequency == 0 or global_step == 1:
+            batch_size_in_images = int(ray_batch_size / (im_h * im_w))
+            
+            if uncoupled_mode or data_pose_mode:
+                images, poses, indices = next(infinite_train_dl)
+
+                # cast rays for all the loaded images:
+                rays_list = []
+                unflattened_rays_list = []
+
+                for pose in poses:
+                    unflattened_rays = cast_rays(
+                            train_dataset.camera_intrinsics,
+                            CameraPose(rotation=pose[:, :3], translation=pose[:, 3:]),
+                            device=sds_vol_mod.device,
+                        )
+                    casted_rays = flatten_rays(unflattened_rays)
+                    rays_list.append(casted_rays)
+                    unflattened_rays_list.append(unflattened_rays)
+
+                unflattened_rays = collate_rays_unflattened(unflattened_rays_list)
+                # images are of shape [B x C x H x W] and pixels are [B * H * W x C]
+
+                rays_batch, pixels_batch, index_batch, selected_idx_in_batch = sample_rays_and_pixels_synchronously(
+                        unflattened_rays, images, indices, batch_size_in_images
+                    )
+                direction_batch = _get_dir_batch_from_poses(poses[selected_idx_in_batch])
+
+            else:
+                pose, dir, pitch, yaw = get_random_pose(HEMISPHERICAL_RADIUS_CONSTANT)
+                unflattened_rays = cast_rays(
+                            train_dataset.camera_intrinsics,
+                            pose,
+                            device=sds_vol_mod.device,
+                        )
+                rays_batch = flatten_rays(unflattened_rays)
+                direction_batch = [dir]
+        
+        # -------------------
+        #  Render Outputs:  |
+        # -------------------
+
+        specular_rendered_batch_sds = sds_vol_mod.render_rays(rays_batch, delta=delta)
+        specular_rendered_pixels_batch_sds = specular_rendered_batch_sds.colour
+
+        # -----------------
+        #  Incur Losses:  |
+        # -----------------
+
+        if do_sds:
+            total_loss = total_loss + class_loss.training_step(specular_rendered_pixels_batch_sds,
+                                                             im_h, im_w, 
+                                                             label=label)
+            # current_sds_max_step = sds_loss.get_current_max_step_ratio()
+
+        # if uncoupled_mode:
+        #     if uncoupled_l2_mode:
+        #         specular_loss = mse_loss(specular_rendered_pixels_batch_sds, pixels_batch)
+        #     else:
+        #         specular_loss = l1_loss(specular_rendered_pixels_batch_sds, pixels_batch)
+        #     total_loss = total_loss + specular_loss * density_correlation_weight
+        # else:
+
+        #     density_correlation_loss, cov_grid = density_correlation_loss_fn(sds_density=sds_density,
+        #                                                          regular_density=regular_density,
+        #                                                          l2_mode=l2_mode,
+        #                                                          l1_mode=l1_mode)
+        #     total_loss = total_loss + density_correlation_loss * density_correlation_weight
+        
+        # if feature_correlation_weight > 0.0:
+        #     feature_correlation_loss = _feature_correlation_loss(sds_features=sds_features,
+        #                                                      regular_features=regular_features,
+        #                                                      density_cov_grid=cov_grid)
+        #     total_loss = total_loss + feature_correlation_loss * feature_correlation_weight
+
+        # ### insert other losses here ###
+        # if tv_density_weight > 0 and global_step % 1 == 0:
+        #     activation = torch.nn.ReLU()
+        #     activated_grid = activation(sds_vol_mod.thre3d_repr._densities)
+        #     tv_density_loss = _tv_loss_on_grid(activated_grid)
+        #     total_loss = total_loss + tv_density_loss * tv_density_weight
+        
+        # if tv_features_weight > 0 and global_step % 1 == 0:
+        #     tv_features_loss = _tv_loss_on_grid(sds_vol_mod.thre3d_repr._features)
+        #     total_loss = total_loss + tv_features_loss * tv_features_weight
+        
+        # -------------
+        #  Optimize:  |
+        # -------------
+
+        total_loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        # -------------
+        #  Log Data:  |
+        # -------------
+
+        # wandb logging:
+        # if log_wandb:
+        #     wandb.log({"Input Direction": dir_to_num_dict[direction_batch[0]]}, step=global_step)
+        #     if tv_density_weight > 0:
+        #         wandb.log({"tv_density_loss" : tv_density_loss.item()}, step=global_step)
+        #     if tv_features_weight > 0:
+        #         wandb.log({"tv_features_loss" : tv_features_loss.item()}, step=global_step)
+        #     # if do_sds:
+        #     #     wandb.log({"current_sds_max_step" : current_sds_max_step}, step=global_step)
+        #     if uncoupled_mode:
+        #         wandb.log({"first selected indx in batch" : index_batch[0]}, step=global_step)
+        #         wandb.log({"specular_loss" : specular_loss.item()}, step=global_step)
+        #         wandb.log({"Input Image": wandb.Image(images[selected_idx_in_batch[0]])}, step=global_step)
+        #     else:
+        #         if feature_correlation_weight > 0:
+        #             wandb.log({"feature_correlation_loss" : feature_correlation_loss.item()}, step=global_step)
+        #         wandb.log({"density_correlation_loss" : density_correlation_loss.item()}, step=global_step)
+        #         if not data_pose_mode:
+        #             wandb.log({"Pitch": pitch}, step=global_step)
+        #             wandb.log({"Yaw": yaw}, step=global_step)
+        #         else:
+        #             wandb.log({"Input Image": wandb.Image(images[selected_idx_in_batch[0]])}, step=global_step)
+        #     lrs = [param_group["lr"] for param_group in optimizer.param_groups]
+        #     wandb.log({"learning rate": lrs[0]}, step=global_step)
+        #     wandb.log({"total_loss" : total_loss}, step=global_step)
+        # ---------------------------------------------------------------------------------
+        
+        time_spent_actually_training += time.perf_counter() - last_time
+        
+        # console loss feedback
+        if (
+            global_step % summary_freq == 0
+            or global_step == 1
+            or global_step == num_iterations
+        ):
+            loss_info_string = (
+                f"Iteration: {global_step}, "
+                f"total_loss: {total_loss.item(): .3f} "
+            )
+            log.info(loss_info_string)
+
+        # step the learning rate schedulers
+        if global_step % lr_freq == 0 and global_step >= lr_decay_start:
+            lr_scheduler.step()
+            new_lrs = [param_group["lr"] for param_group in optimizer.param_groups]
+            log_string = f"Adjusted learning rate | learning rates: {new_lrs} "
+            log.info(log_string)
+
+        # generated rendered feedback visualizations
+        if (
+            global_step % feedback_freq == 0
+            or global_step == 1
+            or global_step == num_iterations
+        ):
+            log.info(
+                f"TIME CHECK: time spent actually training "
+                f"till now: {timedelta(seconds=time_spent_actually_training)}"
+            )
+            with torch.no_grad():
+                if not feedback_pose_given:
+                    if uncoupled_mode or data_pose_mode:
+                        render_feedback_pose = CameraPose(
+                            rotation=train_dataset[index_batch[0]][1][:, :3].cpu().numpy(),
+                            translation=train_dataset[index_batch[0]][1][:, 3:].cpu().numpy(),
+                        )
+                    else:
+                        render_feedback_pose = pose
+
+                visualize_sh_vox_grid_vol_mod_rendered_feedback(
+                       vol_mod=sds_vol_mod,
+                       delta=delta,
+                       vol_mod_name="sds",
+                       render_feedback_pose=render_feedback_pose,
+                       camera_intrinsics=camera_intrinsics,
+                       global_step=global_step,
+                       feedback_logs_dir=render_dir,
+                       parallel_rays_chunk_size=sds_vol_mod.render_config.parallel_rays_chunk_size,
+                       training_time=time_spent_actually_training,
+                       log_diffuse_rendered_version=apply_diffuse_render_regularization,
+                       use_optimized_sampling_mode=False,  # testing how the optimized sampling mode rendering looks 🙂
+                       overridden_num_samples_per_ray=sds_vol_mod.render_config.render_num_samples_per_ray,
+                       verbose_rendering=verbose_rendering,
+                       log_wandb=log_wandb,
+                    )
+            
+        # save the model
+        # if (
+        #     global_step % save_freq == 0
+        #     or global_step == 1
+        #     or global_step == num_iterations
+        # ):
+        #     log.info(
+        #         f"saving model-snapshot at iteration {global_step}"
+        #     )
+        #     torch.save(
+        #         sds_vol_mod.get_save_info(
+        #             extra_info={
+        #                 CAMERA_BOUNDS: camera_bounds,
+        #                 CAMERA_INTRINSICS: camera_intrinsics,
+        #                 HEMISPHERICAL_RADIUS: train_dataset.get_hemispherical_radius_estimate(),
+        #             }
+        #         ),
+        #         model_dir / f"model_iter_{global_step}.pth",
+        #     )
+
+        # ignore all the time spent doing verbose stuff :) and update
+        # the last_time clock event
+        last_time = time.perf_counter()
+        # -------------------------------------------------------------------------------------
+
+    # -----------------------------------------------------------------------------------------
+    # save the final trained model
+    
+    log.info(f"Saving the final model-snapshot :)! Almost there ... yay!")
+    torch.save(
+        delta,
+        model_dir / f"model_final.pth",
+    )
+
+    # training complete yay! :)
+    log.info("Training complete")
+    log.info(
+        f"Total actual training time: {timedelta(seconds=time_spent_actually_training)}"
+    )
+    return sds_vol_mod
 
 def _make_dataloader_from_dataset(
     dataset: PosedImagesDataset, batch_size: int, num_workers: int = 0
