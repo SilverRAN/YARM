@@ -1,4 +1,4 @@
-# [You Always Recognize Me(YARM): Robust Texture Synthesis Against Multi-View Corruption](https://openreview.net/pdf?id=nLW7e7KjN0)
+# [You Always Recognize Me(YARM): Robust Texture Synthesis Against Multi-View Corruption](https://proceedings.mlr.press/v267/ran25a.html)
 This is the official repository of **YARM**
 
 > **You Always Recognize Me(YARM): Robust Texture Synthesis Against Multi-View Corruption**<br>
